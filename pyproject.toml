@@ -44,4 +44,4 @@ amplifier-core = { git = "https://github.com/microsoft/amplifier-core", branch =
 amplifier-config = { git = "https://github.com/microsoft/amplifier-config", branch = "main" }
 amplifier-module-resolution = { git = "https://github.com/microsoft/amplifier-module-resolution", branch = "main" }
 amplifier-collections = { git = "https://github.com/microsoft/amplifier-collections", branch = "main" }
-amplifier-profiles = { git = "https://github.com/microsoft/amplifier-profiles", branch = "main" }
+amplifier-profiles = { git = "https://github.com/momuno/amplifier-profiles", branch = "feat/agents-as-list" }
