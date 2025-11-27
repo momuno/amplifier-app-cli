@@ -237,7 +237,20 @@ def build_effective_config_with_sources(chain_dicts: list[dict[str, Any]], chain
     effective_config["hooks"] = {
         item["module"]: item for item in merged_so_far.get("hooks", []) if isinstance(item, dict) and "module" in item
     }
-    effective_config["agents"] = merged_so_far.get("agents", {})
+
+    # Handle agents structure (extract items from AgentsConfig)
+    agents_config = merged_so_far.get("agents", {})
+    if isinstance(agents_config, dict):
+        agent_items = agents_config.get("items", [])
+        effective_config["agents"] = {
+            item["name"]: item for item in agent_items if isinstance(item, dict) and "name" in item
+        }
+        # Preserve dirs for agent discovery
+        if "dirs" in agents_config:
+            effective_config["agent_dirs"] = agents_config.get("dirs")
+    else:
+        # Fallback for empty or invalid agents config
+        effective_config["agents"] = {}
 
     return effective_config, sources
 
