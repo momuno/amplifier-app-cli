@@ -27,7 +27,9 @@ from amplifier_collections import list_agents
 from amplifier_collections import list_profiles
 from amplifier_collections import uninstall_collection
 from amplifier_module_resolution import GitSource
+from rich.table import Table
 
+from ..console import console
 from ..paths import create_collection_resolver
 from ..paths import get_collection_lock_path
 
@@ -196,15 +198,24 @@ def list(show_all: bool):
         # Show all collections from resolver
         collections = resolver.list_collections()
         if not collections:
-            click.echo("No collections found.")
+            console.print("[yellow]No collections found.[/yellow]")
             return
 
-        click.echo(f"Found {len(collections)} collections:\n")
+        # Build table for all collections
+        table = Table(
+            title=f"All Collections ({len(collections)})",
+            show_header=True,
+            header_style="bold cyan",
+        )
+        table.add_column("", width=2)  # Install marker
+        table.add_column("Name", style="green")
+        table.add_column("Version", style="yellow")
+        table.add_column("Description")
 
         for name, path in collections:
             # Check if it's installed (in lock file)
             is_installed_flag = lock.is_installed(name)
-            marker = "✓" if is_installed_flag else " "
+            marker = "✓" if is_installed_flag else ""
 
             # Load metadata
             try:
@@ -216,37 +227,55 @@ def list(show_all: bool):
                 version = "unknown"
                 desc = "Unable to load metadata"
 
-            click.echo(f"{marker} {name} ({version})")
-            click.echo(f"    {desc}")
-            click.echo(f"    Location: {path}")
-            click.echo()
+            # Truncate description if too long
+            if len(desc) > 50:
+                desc = desc[:47] + "..."
+
+            table.add_row(marker, name, version, desc)
+
+        console.print(table)
+        console.print("\n[dim]✓ = Installed. Use 'amplifier collection add <source>' to install others.[/dim]")
 
     else:
         # Show only installed (in lock file)
         installed = lock.list_entries()
         if not installed:
-            click.echo("No collections installed.")
-            click.echo("\nInstall a collection with:")
-            click.echo("  amplifier collection add git+https://github.com/org/collection@main")
+            console.print("[yellow]No collections installed.[/yellow]")
+            console.print("\nInstall a collection with:")
+            console.print("  [cyan]amplifier collection add git+https://github.com/org/collection@main[/cyan]")
             return
 
-        click.echo(f"Installed collections ({len(installed)}):\n")
+        # Build table for installed collections
+        table = Table(
+            title=f"Installed Collections ({len(installed)})",
+            show_header=True,
+            header_style="bold cyan",
+        )
+        table.add_column("Name", style="green")
+        table.add_column("Version", style="yellow")
+        table.add_column("Source", style="magenta")
 
         for entry in installed:
-            # Load metadata
+            # Load metadata for version
+            # Use resolver to get current path (lock file path may be stale for local installs)
             try:
-                path = Path(entry.path)
+                resolved_path = resolver.resolve(entry.name)
+                path = resolved_path if resolved_path else Path(entry.path)
                 metadata_path = path / "pyproject.toml"
                 metadata = CollectionMetadata.from_pyproject(metadata_path)
-                desc = metadata.description or "No description"
+                version = f"v{metadata.version}"
             except Exception:
-                desc = "Unable to load metadata"
+                version = "unknown"
 
-            click.echo(f"✓ {entry.name}")
-            click.echo(f"    {desc}")
-            click.echo(f"    Source: {entry.source}")
-            click.echo(f"    Installed: {entry.installed_at}")
-            click.echo()
+            # Truncate source if too long
+            source = entry.source
+            if len(source) > 50:
+                source = source[:47] + "..."
+
+            table.add_row(entry.name, version, source)
+
+        console.print(table)
+        console.print("\n[dim]Use 'amplifier collection show <name>' for details[/dim]")
 
 
 @collection.command()
@@ -423,37 +452,79 @@ def remove(name: str, local: bool):
 
 @collection.command()
 @click.argument("collection_name", required=False)
-@click.option("--mutable-only", is_flag=True, help="Only refresh mutable refs (branches, not tags/SHAs)")
-def refresh(collection_name: str | None, mutable_only: bool):
-    """Refresh installed collections.
+@click.option("--check-only", is_flag=True, help="Check for updates without installing")
+@click.option("--mutable-only", is_flag=True, help="Only update mutable refs (branches, not tags/SHAs)")
+def update(collection_name: str | None, check_only: bool, mutable_only: bool):
+    """Update installed collections.
 
-    Re-pulls collections from git to get latest commits.
+    Check for and optionally install updates to collections from their git sources.
     Useful for collections pinned to branches (e.g., @main).
 
     Examples:
 
         \b
-        # Refresh all collections
-        amplifier collection refresh
+        # Check for collection updates
+        amplifier collection update --check-only
 
         \b
-        # Refresh specific collection
-        amplifier collection refresh foundation
+        # Update all collections
+        amplifier collection update
 
         \b
-        # Only refresh branches (not tags/SHAs)
-        amplifier collection refresh --mutable-only
+        # Update specific collection
+        amplifier collection update foundation
+
+        \b
+        # Only update branches (not tags/SHAs)
+        amplifier collection update --mutable-only
     """
+    from ..utils.display import show_collections_report
+    from ..utils.source_status import check_all_sources
+
     # Load collection lock
     lock = CollectionLock(get_collection_lock_path(local=False))
     entries = lock.list_entries()
 
     if not entries:
-        click.echo("No collections installed.")
+        console.print("[dim]No collections installed[/dim]")
+        console.print("[dim]Install collections with 'amplifier collection add <source>'[/dim]")
         return
 
-    # Filter entries based on criteria
-    to_refresh = []
+    # Check-only mode: use source_status to get collection status and display
+    if check_only:
+        console.print("Checking collections for updates...")
+        report = asyncio.run(check_all_sources(include_all_cached=False, force=False))
+
+        # Filter collection_sources if specific collection requested
+        collection_sources = report.collection_sources
+        if collection_name:
+            collection_sources = [s for s in collection_sources if s.name == collection_name]
+            if not collection_sources:
+                console.print(f"[yellow]Collection '{collection_name}' not found or not installed[/yellow]")
+                return
+
+        # Filter by mutability if requested
+        if mutable_only:
+            filtered_sources = []
+            for status in collection_sources:
+                # Find matching entry to check ref
+                entry = next((e for e in entries if e.name == status.name), None)
+                if entry and entry.source.startswith("git+"):
+                    try:
+                        source = GitSource.from_uri(entry.source)
+                        # Skip immutable: tags starting with 'v', or 40-char SHAs
+                        if source.ref.startswith("v") or len(source.ref) == 40:
+                            continue
+                    except Exception:
+                        continue
+                filtered_sources.append(status)
+            collection_sources = filtered_sources
+
+        show_collections_report(collection_sources, check_only=True)
+        return
+
+    # Update mode: filter entries based on criteria
+    to_update = []
     for entry in entries:
         # Filter by collection name if specified
         if collection_name and entry.name != collection_name:
@@ -473,22 +544,22 @@ def refresh(collection_name: str | None, mutable_only: bool):
             except Exception:
                 continue
 
-        to_refresh.append(entry)
+        to_update.append(entry)
 
-    if not to_refresh:
+    if not to_update:
         if collection_name:
-            click.echo(f"Collection '{collection_name}' not found or not refreshable.")
+            console.print(f"[yellow]Collection '{collection_name}' not found or not updatable[/yellow]")
         else:
-            click.echo("No refreshable collections found.")
+            console.print("[dim]No updatable collections found[/dim]")
         return
 
-    # Refresh each collection
-    refreshed = 0
+    # Update each collection
+    updated = 0
     failed = 0
 
-    for entry in to_refresh:
+    for entry in to_update:
         try:
-            click.echo(f"Refreshing {entry.name}...")
+            console.print(f"Updating {entry.name}...")
 
             # Parse source
             source = GitSource.from_uri(entry.source)
@@ -501,16 +572,16 @@ def refresh(collection_name: str | None, mutable_only: bool):
             # Re-install using existing install_collection function
             metadata = asyncio.run(install_collection(source=source, target_dir=target_dir, lock=lock))
 
-            click.echo(f"✓ Refreshed {entry.name} to {metadata.version}")
-            refreshed += 1
+            console.print(f"[green]✓[/green] Updated {entry.name} to {metadata.version}")
+            updated += 1
 
         except Exception as e:
-            click.echo(f"✗ Failed to refresh {entry.name}: {e}", err=True)
-            logger.exception(f"Collection refresh failed for {entry.name}")
+            console.print(f"[red]✗[/red] Failed to update {entry.name}: {e}")
+            logger.exception(f"Collection update failed for {entry.name}")
             failed += 1
 
     # Summary
-    if refreshed > 0:
-        click.echo(f"\n✓ Refreshed {refreshed} collection(s)")
+    if updated > 0:
+        console.print(f"\n[green]✓ Updated {updated} collection(s)[/green]")
     if failed > 0:
-        click.echo(f"✗ Failed to refresh {failed} collection(s)", err=True)
+        console.print(f"[red]✗ Failed to update {failed} collection(s)[/red]")

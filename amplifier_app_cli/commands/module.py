@@ -108,7 +108,9 @@ def list_modules(type: str):
             console.print(table)
 
     # Show cached modules (downloaded from git)
-    cached_modules = _get_cached_modules(type)
+    # Filter out modules that have local source overrides (local takes precedence)
+    local_override_names = _get_local_override_names()
+    cached_modules = [m for m in _get_cached_modules(type) if m["id"] not in local_override_names]
     if cached_modules:
         console.print()
         table = Table(
@@ -129,7 +131,7 @@ def list_modules(type: str):
         console.print(table)
         console.print()
         console.print("[dim]Note: Cached modules are downloaded on-demand when used.[/dim]")
-        console.print("[dim]Use 'amplifier module refresh' to update cached modules.[/dim]")
+        console.print("[dim]Use 'amplifier module update' to update cached modules.[/dim]")
 
 
 @module.command("show")
@@ -341,225 +343,383 @@ def _get_profile_modules(profile_name: str) -> list[dict[str, Any]]:
     return modules
 
 
+def _get_local_override_names() -> set[str]:
+    """Get names of modules that have local source overrides.
+
+    These modules use FileSource and should take precedence over cached versions.
+    """
+    from amplifier_module_resolution import FileSource
+
+    resolver = create_module_resolver()
+    local_names: set[str] = set()
+
+    # Check all cached modules to see which have local overrides
+    from ..utils.module_cache import scan_cached_modules
+
+    for module in scan_cached_modules():
+        try:
+            source, _layer = resolver.resolve_with_layer(module.module_id)
+            if isinstance(source, FileSource):
+                local_names.add(module.module_id)
+        except Exception:
+            pass
+
+    return local_names
+
+
 def _get_cached_modules(type_filter: str = "all") -> list[dict[str, Any]]:
     """Return metadata for all cached modules.
 
-    Scans ~/.amplifier/module-cache/ for cached git modules and extracts
-    their metadata from .amplifier_cache_metadata.json files.
+    Uses centralized scan_cached_modules() utility and converts to dict format
+    for backward compatibility with existing display code.
     """
-    cache_dir = Path.home() / ".amplifier" / "module-cache"
+    from ..utils.module_cache import scan_cached_modules
 
-    if not cache_dir.exists():
-        return []
-
-    modules: list[dict[str, Any]] = []
-
-    for cache_hash in cache_dir.iterdir():
-        if not cache_hash.is_dir():
-            continue
-
-        for ref_dir in cache_hash.iterdir():
-            if not ref_dir.is_dir():
-                continue
-
-            metadata_file = ref_dir / ".amplifier_cache_metadata.json"
-            if not metadata_file.exists():
-                continue
-
-            try:
-                metadata = json.loads(metadata_file.read_text())
-                url = metadata.get("url", "")
-                repo_name = url.split("/")[-1] if url else ""
-
-                # Extract module ID from repo name (e.g., amplifier-module-tool-filesystem -> tool-filesystem)
-                if repo_name.startswith("amplifier-module-"):
-                    module_id = repo_name[len("amplifier-module-") :]
-                else:
-                    module_id = repo_name
-
-                # Infer module type from ID prefix
-                module_type = "unknown"
-                if module_id.startswith("tool-"):
-                    module_type = "tool"
-                elif module_id.startswith("hooks-"):
-                    module_type = "hook"
-                elif module_id.startswith("provider-"):
-                    module_type = "provider"
-                elif module_id.startswith("loop-"):
-                    module_type = "orchestrator"
-                elif module_id.startswith("context-"):
-                    module_type = "context"
-                elif module_id.startswith("agent-"):
-                    module_type = "agent"
-
-                # Apply type filter
-                if type_filter != "all" and type_filter != module_type:
-                    continue
-
-                modules.append(
-                    {
-                        "id": module_id,
-                        "type": module_type,
-                        "ref": metadata.get("ref", "unknown"),
-                        "sha": metadata.get("sha", "")[:8],
-                        "cached_at": metadata.get("cached_at", ""),
-                        "is_mutable": metadata.get("is_mutable", True),
-                        "url": url,
-                    }
-                )
-            except Exception:
-                # Skip invalid metadata files
-                continue
-
-    # Sort by module ID for consistent output
-    modules.sort(key=lambda m: m["id"])
-    return modules
+    modules = scan_cached_modules(type_filter)
+    return [
+        {
+            "id": m.module_id,
+            "type": m.module_type,
+            "ref": m.ref,
+            "sha": m.sha,
+            "cached_at": m.cached_at,
+            "is_mutable": m.is_mutable,
+            "url": m.url,
+        }
+        for m in modules
+    ]
 
 
-@module.command("refresh")
+@module.command("update")
 @click.argument("module_id", required=False)
-@click.option("--mutable-only", is_flag=True, help="Only refresh mutable refs (branches, not tags/SHAs)")
-def module_refresh(module_id: str | None, mutable_only: bool):
-    """Refresh module cache.
+@click.option("--check-only", is_flag=True, help="Check for updates without installing")
+@click.option("--mutable-only", is_flag=True, help="Only update mutable refs (branches, not tags/SHAs)")
+def module_update(module_id: str | None, check_only: bool, mutable_only: bool):
+    """Update module cache.
 
-    Clears cached git modules so they re-download on next use.
+    Clears cached git modules and re-downloads them immediately.
     Useful for updating modules pinned to branches (e.g., @main).
-    """
-    from pathlib import Path
 
-    cache_dir = Path.home() / ".amplifier" / "module-cache"
+    Use --check-only to see available updates without installing.
+    """
+    from ..utils.display import show_modules_report
+    from ..utils.module_cache import clear_module_cache
+    from ..utils.module_cache import find_cached_module
+    from ..utils.module_cache import get_cache_dir
+    from ..utils.module_cache import update_module
+    from ..utils.source_status import check_all_sources
+
+    cache_dir = get_cache_dir()
 
     if not cache_dir.exists():
         console.print("[yellow]No module cache found[/yellow]")
         console.print("Modules will download on next use")
         return
 
+    # Check-only mode: show status using shared display utilities
+    if check_only:
+        console.print("Checking for updates...")
+        report = asyncio.run(check_all_sources(include_all_cached=True))
+        show_modules_report(report.cached_git_sources, report.local_file_sources, check_only=True)
+        return
+
     if module_id:
-        # Refresh specific module - find matching cache dirs
-        import json
+        # Update specific module - find it first to get URL and ref
+        cached_module = find_cached_module(module_id)
 
-        refreshed = 0
-        for cache_hash in cache_dir.iterdir():
-            if not cache_hash.is_dir():
-                continue
+        if not cached_module:
+            console.print(f"[yellow]No cached module found for '{module_id}'[/yellow]")
+            return
 
-            for ref_dir in cache_hash.iterdir():
-                if not ref_dir.is_dir():
-                    continue
+        # Check mutable-only flag
+        if mutable_only and not cached_module.is_mutable:
+            console.print(f"[dim]Skipping {module_id} - immutable ref (tag/SHA)[/dim]")
+            return
 
-                # Check metadata
-                metadata_file = ref_dir / ".amplifier_cache_metadata.json"
-                if not metadata_file.exists():
-                    continue
-
-                try:
-                    metadata = json.loads(metadata_file.read_text())
-
-                    # Skip if wrong module
-                    if metadata.get("url", "").split("/")[-1] != f"amplifier-module-{module_id}":
-                        continue
-
-                    # Skip if mutable-only and this is immutable
-                    if mutable_only and not metadata.get("is_mutable", True):
-                        continue
-
-                    # Delete cache dir
-                    import shutil
-
-                    shutil.rmtree(ref_dir)
-                    console.print(f"[green]✓ Cleared cache for {module_id}@{metadata['ref']}[/green]")
-                    refreshed += 1
-                except Exception as e:
-                    console.print(f"[yellow]⚠ Could not clear {ref_dir}: {e}[/yellow]")
-
-        if refreshed == 0:
-            console.print(f"[yellow]No cached modules found for '{module_id}'[/yellow]")
+        # Update: clear + immediate re-download
+        console.print(f"Updating {module_id}@{cached_module.ref}...")
+        try:
+            update_module(
+                url=cached_module.url,
+                ref=cached_module.ref,
+                progress_callback=lambda mid, status: console.print(f"  {status}...", end="\r"),
+            )
+            console.print(f"[green]✓ Updated {module_id}@{cached_module.ref}[/green]")
+        except Exception as e:
+            console.print(f"[red]✗ Failed to update {module_id}: {e}[/red]")
     else:
-        # Refresh all modules
-        import json
-        import shutil
+        # Update all modules - clear cache, modules will re-download on next use
+        # For "all modules" case, we just clear (immediate re-download would take too long)
+        cleared, skipped = clear_module_cache(mutable_only=mutable_only)
 
-        refreshed = 0
-        skipped = 0
-
-        for cache_hash in cache_dir.iterdir():
-            if not cache_hash.is_dir():
-                continue
-
-            for ref_dir in cache_hash.iterdir():
-                if not ref_dir.is_dir():
-                    continue
-
-                # Check if we should skip immutable refs
-                if mutable_only:
-                    metadata_file = ref_dir / ".amplifier_cache_metadata.json"
-                    if metadata_file.exists():
-                        try:
-                            metadata = json.loads(metadata_file.read_text())
-                            if not metadata.get("is_mutable", True):
-                                skipped += 1
-                                continue
-                        except Exception:
-                            pass
-
-                # Delete cache dir
-                shutil.rmtree(ref_dir)
-                refreshed += 1
-
-        console.print(f"[green]✓ Cleared {refreshed} cached modules[/green]")
+        console.print(f"[green]✓ Cleared {cleared} cached modules[/green]")
         if skipped > 0:
             console.print(f"[dim]Skipped {skipped} immutable refs (tags/SHAs)[/dim]")
         console.print("Modules will re-download on next use")
 
 
-@module.command("check-updates")
-def module_check_updates():
-    """Check for module updates.
+@module.command("validate")
+@click.argument("module_path", type=click.Path(exists=True))
+@click.option(
+    "--type",
+    "-t",
+    "module_type",
+    type=click.Choice(["provider", "tool", "hook", "orchestrator", "context"]),
+    help="Module type (auto-detected from name if not specified)",
+)
+@click.option(
+    "--output",
+    "-o",
+    "output_format",
+    type=click.Choice(["human", "json"]),
+    default="human",
+    help="Output format",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    default=False,
+    help="Show additional details and actionable tips for failed checks",
+)
+@click.option(
+    "--behavioral",
+    "-b",
+    is_flag=True,
+    default=False,
+    help="Run behavioral tests in addition to structural validation",
+)
+def module_validate(module_path: str, module_type: str | None, output_format: str, verbose: bool, behavioral: bool):
+    """Validate a module against its contract.
 
-    Checks all sources (local files and cached git) for updates.
+    MODULE_PATH should be a path to a module directory.
+    Module type is auto-detected from directory name (e.g., provider-*, tool-*, hooks-*).
+
+    Use --behavioral to run pytest-based behavioral tests after structural validation.
     """
+    asyncio.run(_module_validate_async(module_path, module_type, output_format, verbose, behavioral))
 
-    console.print("Checking for updates...")
 
-    # For module check-updates, include ALL cached modules (not just active)
-    from ..utils.source_status import check_all_sources
+async def _module_validate_async(
+    module_path: str, module_type: str | None, output_format: str, verbose: bool, behavioral: bool
+):
+    """Async implementation of module validate."""
+    from amplifier_core.validation import ContextValidator
+    from amplifier_core.validation import HookValidator
+    from amplifier_core.validation import OrchestratorValidator
+    from amplifier_core.validation import ProviderValidator
+    from amplifier_core.validation import ToolValidator
 
-    report = asyncio.run(check_all_sources(include_all_cached=True))
+    path = Path(module_path).resolve()
 
-    # Show git cache updates
-    if report.cached_git_sources:
-        console.print()
-        console.print("[yellow]Cached Git Sources (updates available):[/yellow]")
-        for status in report.cached_git_sources:
-            console.print(f"  • {status.name}@{status.ref} ({status.layer})")
-            console.print(f"    {status.cached_sha} → {status.remote_sha} ({status.age_days}d old)")
-        console.print()
-        console.print("Run [cyan]amplifier module refresh[/cyan] to update")
+    # Auto-detect module type from directory name if not specified
+    if module_type is None:
+        module_type = _infer_module_type_for_validation(path.name)
+        if module_type is None:
+            console.print("[red]Could not auto-detect module type from directory name.[/red]")
+            console.print("Use --type flag to specify: provider, tool, hook, orchestrator, or context")
+            raise SystemExit(1)
 
-    # Show local file statuses
-    if report.local_file_sources:
-        console.print()
-        console.print("[cyan]Local Sources:[/cyan]")
-        for status in report.local_file_sources:
-            console.print(f"  • {status.name} ({status.layer})")
-            console.print(f"    Path: {status.path}")
+    # Select validator
+    validators = {
+        "provider": ProviderValidator,
+        "tool": ToolValidator,
+        "hook": HookValidator,
+        "orchestrator": OrchestratorValidator,
+        "context": ContextValidator,
+    }
+    validator = validators[module_type]()
 
-            if status.uncommitted_changes:
-                console.print("    ⚠ Uncommitted changes")
-            if status.unpushed_commits:
-                console.print("    ⚠ Unpushed commits")
+    # Run validation
+    result = await validator.validate(path)
 
-            if status.has_remote and status.remote_sha and status.remote_sha != status.local_sha:
-                console.print(f"    ℹ Remote ahead: {status.local_sha} → {status.remote_sha}")
-                if status.commits_behind > 0:
-                    console.print(f"      {status.commits_behind} commits behind")
+    # Output
+    if output_format == "json":
+        print(
+            json.dumps(
+                {
+                    "module_type": result.module_type,
+                    "module_path": result.module_path,
+                    "passed": result.passed,
+                    "checks": [
+                        {
+                            "name": c.name,
+                            "passed": c.passed,
+                            "message": c.message,
+                            "severity": c.severity,
+                        }
+                        for c in result.checks
+                    ],
+                },
+                indent=2,
+            )
+        )
+    else:
+        _display_validation_result(result, verbose=verbose)
 
-    if not report.has_updates and not report.has_local_changes:
-        if report.cached_modules_checked == 0:
-            console.print("[dim]No cached modules to check[/dim]")
-            console.print("[dim]Modules will be cached when first used[/dim]")
+    # Exit with error code if structural validation failed
+    if not result.passed:
+        raise SystemExit(1)
+
+    # Run behavioral tests if requested
+    if behavioral:
+        behavioral_result = _run_behavioral_tests(str(path), module_type)
+        if not behavioral_result:
+            raise SystemExit(1)
+
+
+def _run_behavioral_tests(module_path: str, module_type: str) -> bool:
+    """Run pytest behavioral tests for a module.
+
+    Args:
+        module_path: Path to module directory
+        module_type: Type of module (provider, tool, hook, orchestrator, context)
+
+    Returns:
+        True if tests passed, False otherwise
+    """
+    import subprocess
+
+    console.print()
+    console.print("[bold]Running behavioral tests...[/bold]")
+
+    # Find the behavioral test file - look in amplifier-core package
+    try:
+        import amplifier_core
+
+        core_path = Path(amplifier_core.__file__).parent
+        test_file = core_path / "validation" / "behavioral" / f"test_{module_type}.py"
+
+        if not test_file.exists():
+            console.print(f"[yellow]No behavioral tests found for {module_type} modules[/yellow]")
+            return True  # Not a failure - tests just don't exist yet
+
+    except ImportError:
+        console.print("[red]amplifier-core not installed - cannot run behavioral tests[/red]")
+        return False
+
+    # Run pytest with the module path
+    cmd = [
+        "pytest",
+        str(test_file),
+        f"--module-path={module_path}",
+        "-v",
+        "--tb=short",
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        console.print("[green]✓ Behavioral tests passed[/green]")
+        if result.stdout:
+            console.print(result.stdout)
+        return True
+
+    console.print("[red]✗ Behavioral tests failed[/red]")
+    if result.stdout:
+        console.print(result.stdout)
+    if result.stderr:
+        console.print(f"[red]{result.stderr}[/red]")
+    return False
+
+
+def _infer_module_type_for_validation(name: str) -> str | None:
+    """Infer module type from directory/module name for validation."""
+    prefixes = {
+        "provider-": "provider",
+        "tool-": "tool",
+        "hooks-": "hook",
+        "loop-": "orchestrator",
+        "context-": "context",
+    }
+    for prefix, mod_type in prefixes.items():
+        if prefix in name:
+            return mod_type
+    return None
+
+
+def _display_validation_result(result, verbose: bool = False):
+    """Display validation result with Rich formatting.
+
+    Args:
+        result: ValidationResult from the validator
+        verbose: If True, show actionable tips for failed checks
+    """
+    # Summary header
+    status_color = "green" if result.passed else "red"
+    console.print(
+        Panel(
+            f"[{status_color}]{result.summary()}[/{status_color}]",
+            title=f"Validation: {result.module_type}",
+            subtitle=result.module_path,
+        )
+    )
+
+    # Detailed checks table
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Check")
+    table.add_column("Status")
+    table.add_column("Message")
+
+    for check in result.checks:
+        if check.passed:
+            status = "[green]PASS[/green]"
+        elif check.severity == "warning":
+            status = "[yellow]WARN[/yellow]"
         else:
-            console.print(f"[green]✓ Checked {report.cached_modules_checked} cached modules - all up to date[/green]")
+            status = "[red]FAIL[/red]"
+        table.add_row(check.name, status, check.message)
+
+    console.print(table)
+
+    # Verbose mode: show actionable tips for failed checks
+    if verbose and not result.passed:
+        console.print()
+        console.print("[dim]─── Actionable Tips ───[/dim]")
+        for check in result.checks:
+            if not check.passed:
+                tip = _get_actionable_tip_for_check(check.name, result.module_type)
+                if tip:
+                    console.print(f"[dim]• {check.name}:[/dim] {tip}")
+
+
+def _get_actionable_tip_for_check(check_name: str, module_type: str) -> str | None:
+    """Generate an actionable tip based on the failed check name and module type."""
+    check_lower = check_name.lower()
+
+    # Common tips based on check patterns
+    if "mount" in check_lower:
+        return "Ensure your module exports an async mount(coordinator, config) function in __init__.py"
+
+    if "package" in check_lower or "structure" in check_lower:
+        return "Check that the module has a valid pyproject.toml and __init__.py"
+
+    if "export" in check_lower:
+        return "Verify that required exports are present in the module's __init__.py"
+
+    if "signature" in check_lower:
+        return f"Check that function signatures match the {module_type} contract"
+
+    if "protocol" in check_lower or "compliance" in check_lower:
+        return f"Ensure your module implements all required methods from the {module_type} protocol"
+
+    if "entry" in check_lower or "entrypoint" in check_lower:
+        return "Verify that pyproject.toml defines the correct entry point under [project.entry-points]"
+
+    if "import" in check_lower:
+        return "Check that the module has a valid __init__.py file in the package directory"
+
+    # Module type specific tips
+    if module_type == "provider" and "model" in check_lower:
+        return "Provider must implement get_info() and list_models() methods"
+
+    if module_type == "tool" and "execute" in check_lower:
+        return "Tool must implement async execute(input) -> ToolResult method"
+
+    if module_type == "hook" and "call" in check_lower:
+        return "Hook must implement __call__(event, data) -> HookResult method"
+
+    return None
 
 
 __all__ = ["module"]

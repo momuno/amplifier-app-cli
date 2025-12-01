@@ -15,6 +15,7 @@ from typing import Any
 
 import click
 from amplifier_core import AmplifierSession
+from amplifier_core import ModuleValidationError
 from amplifier_profiles.utils import parse_markdown_body
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
@@ -24,17 +25,18 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.panel import Panel
 
+from .commands.agents import agents as agents_group
 from .commands.collection import collection as collection_group
 from .commands.init import check_first_run
 from .commands.init import init_cmd
 from .commands.init import prompt_first_run_init
-from .commands.logs import logs_cmd
 from .commands.module import module as module_group
 from .commands.profile import profile as profile_group
 from .commands.provider import provider as provider_group
 from .commands.run import register_run_command
 from .commands.session import register_session_commands
 from .commands.source import source as source_group
+from .commands.tool import tool as tool_group
 from .commands.update import update as update_cmd
 from .console import Markdown
 from .console import console
@@ -43,6 +45,7 @@ from .key_manager import KeyManager
 from .paths import create_module_resolver
 from .paths import create_profile_loader
 from .session_store import SessionStore
+from .ui.error_display import display_validation_error
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +135,7 @@ def _completion_already_installed(config_file: Path, shell: str) -> bool:
         return False
 
     try:
-        content = config_file.read_text()
+        content = config_file.read_text(encoding="utf-8")
         completion_marker = f"_AMPLIFIER_COMPLETE={shell}_source"
         return completion_marker in content
     except Exception:
@@ -191,12 +194,12 @@ def _install_completion_to_config(config_file: Path, shell: str) -> bool:
                 text=True,
             )
             if result.returncode == 0:
-                config_file.write_text(result.stdout)
+                config_file.write_text(result.stdout, encoding="utf-8")
                 return True
             return False
 
         # For bash/zsh, append eval line
-        with open(config_file, "a") as f:
+        with open(config_file, "a", encoding="utf-8") as f:
             f.write("\n# Amplifier shell completion\n")
             f.write(f'eval "$(_AMPLIFIER_COMPLETE={shell}_source amplifier)"\n')
 
@@ -232,7 +235,6 @@ class CommandProcessor:
             "action": "disable_plan_mode",
             "description": "Exit plan mode and allow modifications",
         },
-        "/stop": {"action": "halt_execution", "description": "Stop current execution"},
         "/save": {"action": "save_transcript", "description": "Save conversation transcript"},
         "/status": {"action": "show_status", "description": "Show session status"},
         "/clear": {"action": "clear_context", "description": "Clear conversation context"},
@@ -242,10 +244,10 @@ class CommandProcessor:
         "/agents": {"action": "list_agents", "description": "List available agents"},
     }
 
-    def __init__(self, session: AmplifierSession):
+    def __init__(self, session: AmplifierSession, profile_name: str = "unknown"):
         self.session = session
+        self.profile_name = profile_name
         self.plan_mode = False
-        self.halted = False
         self.plan_mode_unregister = None  # Store unregister function
 
     def process_input(self, user_input: str) -> tuple[str, dict[str, Any]]:
@@ -281,14 +283,6 @@ class CommandProcessor:
             self.plan_mode = False
             self._configure_plan_mode(False)
             return "✓ Plan Mode disabled - modifications enabled"
-
-        if action == "halt_execution":
-            self.halted = True
-            # Signal orchestrator to stop if it supports halting
-            orchestrator = self.session.coordinator.get("orchestrator")
-            if orchestrator and hasattr(orchestrator, "halt"):
-                await orchestrator.halt()
-            return "✓ Execution halted"
 
         if action == "save_transcript":
             path = await self._save_transcript(data.get("args", ""))
@@ -369,7 +363,7 @@ class CommandProcessor:
             path = Path(".amplifier/transcripts") / filename
             path.parent.mkdir(parents=True, exist_ok=True)
 
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(
                     {
                         "timestamp": datetime.now().isoformat(),
@@ -424,9 +418,37 @@ class CommandProcessor:
         return "\n".join(lines)
 
     async def _get_config_display(self) -> str:
-        """Display current configuration."""
-        config_str = json.dumps(self.session.config, indent=2)
-        return f"Current Configuration:\n{config_str}"
+        """Display current configuration using profile show format."""
+        from .commands.profile import render_effective_config
+        from .console import console
+        from .paths import create_config_manager
+        from .paths import create_profile_loader
+
+        try:
+            loader = create_profile_loader()
+            config_manager = create_config_manager()
+
+            # Load inheritance chain for source tracking
+            chain_names = loader.get_inheritance_chain(self.profile_name)
+            chain_dicts = loader.load_inheritance_chain_dicts(self.profile_name)
+            source_overrides = config_manager.get_module_sources()
+
+            # render_effective_config prints directly to console with rich formatting
+            render_effective_config(chain_dicts, chain_names, source_overrides, detailed=True)
+
+            # Also show loaded agents (available at runtime)
+            loaded_agents = self.session.config.get("agents", {})
+            if loaded_agents:
+                console.print("[bold]Loaded Agents:[/bold]")
+                for name in sorted(loaded_agents.keys()):
+                    console.print(f"  {name}")
+                console.print()
+
+            return ""  # Output already printed
+        except Exception:
+            # Fallback to raw JSON if profile loading fails
+            config_str = json.dumps(self.session.config, indent=2)
+            return f"Current Configuration:\n{config_str}"
 
     async def _list_tools(self) -> str:
         """List available tools."""
@@ -457,19 +479,44 @@ class CommandProcessor:
         if not all_agents:
             return "No agents available (check profile's agents configuration)"
 
-        # Format output
-        lines = ["Available Agents:"]
-        for name, config in sorted(all_agents.items()):
-            meta = config.get("meta", {})
-            description = meta.get("description", "No description")
-            # Handle multi-line descriptions - take first line only
-            first_line = description.split("\n")[0]
-            # Truncate if too long
-            if len(first_line) > 50:
-                first_line = first_line[:47] + "..."
-            lines.append(f"  {name:<25} - {first_line}")
+        # Display each agent with full frontmatter (excluding instruction)
+        console.print(f"\n[bold]Available Agents[/bold] ({len(all_agents)} loaded)\n")
 
-        return "\n".join(lines)
+        for name, config in sorted(all_agents.items()):
+            # Agent name as header
+            console.print(f"[bold cyan]{name}[/bold cyan]")
+
+            # Full description
+            description = config.get("description", "No description")
+            console.print(f"  [dim]Description:[/dim] {description}")
+
+            # Providers
+            providers = config.get("providers", [])
+            if providers:
+                provider_names = [p.get("module", "unknown") for p in providers]
+                console.print(f"  [dim]Providers:[/dim] {', '.join(provider_names)}")
+
+            # Tools
+            tools = config.get("tools", [])
+            if tools:
+                tool_names = [t.get("module", "unknown") for t in tools]
+                console.print(f"  [dim]Tools:[/dim] {', '.join(tool_names)}")
+
+            # Hooks
+            hooks = config.get("hooks", [])
+            if hooks:
+                hook_names = [h.get("module", "unknown") for h in hooks]
+                console.print(f"  [dim]Hooks:[/dim] {', '.join(hook_names)}")
+
+            # Session overrides
+            session = config.get("session", {})
+            if session:
+                session_items = [f"{k}={v}" for k, v in session.items()]
+                console.print(f"  [dim]Session:[/dim] {', '.join(session_items)}")
+
+            console.print()  # Blank line between agents
+
+        return ""  # Output already printed
 
 
 def get_module_search_paths() -> list[Path]:
@@ -647,7 +694,7 @@ async def _process_profile_mentions(session: AmplifierSession, profile_name: str
 
         logger.debug(f"Found profile file: {profile_file}")
 
-        markdown_body = parse_markdown_body(profile_file.read_text())
+        markdown_body = parse_markdown_body(profile_file.read_text(encoding="utf-8"))
         if not markdown_body:
             logger.debug(f"No markdown body in profile: {profile_name}")
             return
@@ -799,8 +846,27 @@ async def interactive_chat(
     session.coordinator.register_capability("mention_deduplicator", mention_deduplicator)
 
     # Show loading indicator during initialization (modules loading, etc.)
-    with console.status("[dim]Loading...[/dim]", spinner="dots"):
-        await session.initialize()
+    # Temporarily suppress amplifier_core error logs during init - we'll show clean error panel if it fails
+    core_logger = logging.getLogger("amplifier_core")
+    original_level = core_logger.level
+    if not verbose:
+        core_logger.setLevel(logging.CRITICAL)
+    try:
+        with console.status("[dim]Loading...[/dim]", spinner="dots"):
+            await session.initialize()
+    except (ModuleValidationError, RuntimeError) as e:
+        # Restore log level before showing error
+        core_logger.setLevel(original_level)
+        # Try clean error display for module validation errors
+        if not display_validation_error(console, e, verbose=verbose):
+            # Fall back to generic error display
+            console.print(f"[red]Error:[/red] {e}")
+            if verbose:
+                console.print_exception()
+        sys.exit(1)
+    finally:
+        # Restore log level on success path
+        core_logger.setLevel(original_level)
 
     # Process profile @mentions if profile has markdown body
     await _process_profile_mentions(session, profile_name)
@@ -827,7 +893,7 @@ async def interactive_chat(
     session.coordinator.register_capability("session.spawn_with_agent", spawn_with_agent_wrapper)
 
     # Create command processor
-    command_processor = CommandProcessor(session)
+    command_processor = CommandProcessor(session, profile_name)
 
     # Create session store for saving
     store = SessionStore()
@@ -934,8 +1000,6 @@ async def interactive_chat(
                             except asyncio.CancelledError:
                                 # Ctrl-C pressed during processing
                                 console.print("\n[yellow]Aborted (Ctrl-C)[/yellow]")
-                                if command_processor.halted:
-                                    command_processor.halted = False
                         finally:
                             # Always restore original signal handler
                             signal.signal(signal.SIGINT, original_handler)
@@ -949,6 +1013,10 @@ async def interactive_chat(
                 # Ctrl-D - graceful exit
                 console.print("\n[dim]Exiting...[/dim]")
                 break
+
+            except ModuleValidationError as e:
+                # Clean display for module validation errors
+                display_validation_error(console, e, verbose=verbose)
 
             except Exception as e:
                 console.print(f"[red]Error:[/red] {e}")
@@ -1090,6 +1158,24 @@ async def execute_single(
             if verbose and output_format == "text":
                 console.print(f"[dim]Session {actual_session_id[:8]}... saved[/dim]")
 
+    except ModuleValidationError as e:
+        if output_format in ["json", "json-trace"]:
+            # Restore stdout before writing error JSON
+            if original_stdout is not None:
+                sys.stdout = original_stdout
+            error_output = {
+                "status": "error",
+                "error": str(e),
+                "error_type": "ModuleValidationError",
+                "session_id": getattr(session, "session_id", None) if "session" in locals() else None,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            print(json.dumps(error_output, indent=2))
+        else:
+            # Clean display for module validation errors
+            display_validation_error(console, e, verbose=verbose)
+        sys.exit(1)
+
     except Exception as e:
         if output_format in ["json", "json-trace"]:
             # Restore stdout before writing error JSON
@@ -1104,10 +1190,12 @@ async def execute_single(
             }
             print(json.dumps(error_output, indent=2))
         else:
-            # Text error output
-            console.print(f"[red]Error:[/red] {e}")
-            if verbose:
-                console.print_exception()
+            # Try clean display for module validation errors (including wrapped ones)
+            if not display_validation_error(console, e, verbose=verbose):
+                # Fall back to generic error output
+                console.print(f"[red]Error:[/red] {e}")
+                if verbose:
+                    console.print_exception()
         sys.exit(1)
     finally:
         await session.cleanup()
@@ -1264,6 +1352,24 @@ async def execute_single_with_session(
             if verbose and output_format == "text":
                 console.print(f"[dim]Session {session_id[:8]}... saved[/dim]")
 
+    except ModuleValidationError as e:
+        if output_format in ["json", "json-trace"]:
+            # Restore stdout before writing error JSON
+            if original_stdout is not None:
+                sys.stdout = original_stdout
+            error_output = {
+                "status": "error",
+                "error": str(e),
+                "error_type": "ModuleValidationError",
+                "session_id": session_id if "session_id" in locals() else None,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            print(json.dumps(error_output, indent=2))
+        else:
+            # Clean display for module validation errors
+            display_validation_error(console, e, verbose=verbose)
+        sys.exit(1)
+
     except Exception as e:
         if output_format in ["json", "json-trace"]:
             # Restore stdout before writing error JSON
@@ -1278,10 +1384,12 @@ async def execute_single_with_session(
             }
             print(json.dumps(error_output, indent=2))
         else:
-            # Text error output
-            console.print(f"[red]Error:[/red] {e}")
-            if verbose:
-                console.print_exception()
+            # Try clean display for module validation errors (including wrapped ones)
+            if not display_validation_error(console, e, verbose=verbose):
+                # Fall back to generic error output
+                console.print(f"[red]Error:[/red] {e}")
+                if verbose:
+                    console.print_exception()
         sys.exit(1)
     finally:
         await session.cleanup()
@@ -1302,17 +1410,15 @@ async def execute_single_with_session(
 
 
 # Register standalone commands
+cli.add_command(agents_group)
 cli.add_command(collection_group)
-cli.add_command(logs_cmd)
 cli.add_command(init_cmd)
 cli.add_command(profile_group)
 cli.add_command(module_group)
 cli.add_command(provider_group)
 cli.add_command(source_group)
+cli.add_command(tool_group)
 cli.add_command(update_cmd)
-
-# Note: Agent commands removed (YAGNI - not implemented, agents managed via profiles)
-# Agent configuration happens in profiles, agent loading via amplifier-profiles library
 
 
 async def interactive_chat_with_session(
@@ -1353,7 +1459,7 @@ async def interactive_chat_with_session(
         await context.set_messages(initial_transcript)
 
     # Create command processor
-    command_processor = CommandProcessor(session)
+    command_processor = CommandProcessor(session, profile_name)
 
     # Note: Banner already shown by history display function in commands/session.py
     # No need to show duplicate banner here for resumed sessions
@@ -1442,8 +1548,6 @@ async def interactive_chat_with_session(
                             except asyncio.CancelledError:
                                 # Ctrl-C pressed during processing
                                 console.print("\n[yellow]Aborted (Ctrl-C)[/yellow]")
-                                if command_processor.halted:
-                                    command_processor.halted = False
                         finally:
                             # Always restore original signal handler
                             signal.signal(signal.SIGINT, original_handler)
